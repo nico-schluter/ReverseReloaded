@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- Mesh wireframe: two triangles suggesting a triangulated surface -->
+  <g fill="none" stroke="#6A6A6A" stroke-width="1" stroke-linejoin="round">
+    <polygon points="4,28 16,6 28,28"/>
+    <line x1="10" y1="17" x2="22" y2="17"/>
+    <line x1="7"  y1="22.5" x2="25" y2="22.5"/>
+  </g>
+
+  <!-- Fitted plane surface: blue parallelogram in perspective -->
+  <polygon points="6,11 26,11 24,19 8,19"
+           fill="#0696D7" fill-opacity="0.82"
+           stroke="#0479B3" stroke-width="0.75" stroke-linejoin="round"/>
+
+  <!-- Selected vertex highlights: orange dots at mesh vertices -->
+  <circle cx="16" cy="6"  r="2.5" fill="#E87722"/>
+  <circle cx="4"  cy="28" r="2.5" fill="#E87722"/>
+  <circle cx="28" cy="28" r="2.5" fill="#E87722"/>
+</svg>

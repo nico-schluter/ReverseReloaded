@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">
+  <!-- Mesh wireframe -->
+  <g fill="none" stroke="#6A6A6A" stroke-width="0.75" stroke-linejoin="round">
+    <polygon points="2,14 8,2 14,14"/>
+    <line x1="5" y1="8" x2="11" y2="8"/>
+  </g>
+
+  <!-- Fitted plane surface -->
+  <polygon points="3,5.5 13,5.5 12,9.5 4,9.5"
+           fill="#0696D7" fill-opacity="0.82"
+           stroke="#0479B3" stroke-width="0.5" stroke-linejoin="round"/>
+
+  <!-- Selected vertex highlights -->
+  <circle cx="8"  cy="2"  r="1.5" fill="#E87722"/>
+  <circle cx="2"  cy="14" r="1.5" fill="#E87722"/>
+  <circle cx="14" cy="14" r="1.5" fill="#E87722"/>
+</svg>

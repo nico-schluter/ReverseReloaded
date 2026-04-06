@@ -1,0 +1,201 @@
+
+Message 1 of 8
+
+I am working on an addin that will add a custom feature to make parametric helical patterns of objects. So far i have the core functionality of the execute command working as intended.
+
+Helix Pattern Test v15.png
+
+However, I get a runtime error when I try to add the customFeatureInput.
+
+ 
+
+Failed:
+
+Traceback (most recent call last):
+
+File "C:/Users/shopuser/AppData/Roaming/Autodesk/Autodesk Fusion 360/API/AddIns/HelicalPattern/HelicalPattern.py", line 186, in notify
+
+features.customFeatures.add(customFeatInput)
+
+File "C:\Users/shopuser/AppData/Local/Autodesk/webdeploy/production/7627f627889be835182cfc345110c3c9f5bc9cc3/Api/Python/packages\adsk\fusion.py", line 22142, in add
+
+return _fusion.CustomFeatures_add(self, input)
+
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+RuntimeError: 3 : make params invalid
+
+ 
+
+I have tried many different combinations of things to try to make this work to no avail. Does anyone know what this means or how to fix it?
+
+ 
+
+I have attached what I have for my addin so far as a .txt
+HelicalPattern.txt
+Report
+Accepted solutions (1)
+Solution 1
+Tags
+
+    API
+    Custom Feature
+    pattern
+
+Replies (7)
+Message 2 of 8
+Jorge_Jaramillo
+Collaborator Jorge_Jaramillo
+‎08-21-2025 01:33 PM
+
+Hi,
+
+ 
+
+I have the following remarks about your AddIn:
+
+- Did you tried creating the CustomFeature without any of the 3 parameters? Just to check the parameters are not an issue.
+
+- Did you checked the result value from each of the customFeatInput.addCustomParameter() method call?  It returns a boolean, which indicates the parameter is well defined for the feature.
+
+- Or maybe, try creating the CustomFeature with a single parameter at a time, so you can check which parameter is making it to fail.
+
+- This is not the cause of your problem, but it could be an issue later: the global variables design, root and defaultLengthUnits depends on the document over the AddIn will work on; so, you should set them in the CommandCreateHandler with the active design.  The way you have them set, they reference the active at the moment the AddIn is being activated.
+
+ 
+
+I hope this can help out.
+
+ 
+
+Regards,
+
+Jorge Jaramillo
+
+ 
+Report
+Message 3 of 8
+crazybrain13
+Contributor crazybrain13
+in reply to Jorge_Jaramillo
+‎08-22-2025 05:04 AM
+
+Thanks for the input!
+
+ 
+
+Yes, I did try creating the customFeature without any of the parameters, and the issue still happens. I also checked the return values for customFeatureInput.addCustomParameter() method call, and they all returned true. I even tried singling out each parameter, still the same error.
+
+ 
+
+Thanks for the heads up about my global variables. I moved the assignment for those variables into the CommandCreatedHandler.
+
+ 
+
+This really has me stumped. From everything I can see, I have set this up exactly like the documentation says and It's just not working. I just keep assuming I must have done something wrong somewhere because I can't find any information about this error and no one else in the forums has posted anything about it.
+Report
+Message 4 of 8
+scm
+Explorer scm
+‎11-20-2025 10:59 PM
+Accepted solution
+
+One reason to get this error is if the Add-In's manifest file doesn't have an id field defined.
+
+ 
+
+This can easily happen for two reasons:
+
+    The documentation explicitly says that the id field is not needed: "This property is not used and can be left empty."
+    When creating a new add-in, the default template fusion generates does not set an id.
+
+ 
+
+Fusion has to be restarted for a change to the manifest file to take effect. Just starting/stopping the add-in is not sufficient.
+
+ 
+
+Example manifest with an id (a randomly generated UUID works fine):
+
+ 
+
+{
+	"autodeskProduct":	"Fusion",
+	"type":	"addin",
+	"id": "8ddf023b-89bd-4313-84ea-1d94c4dba3bd",
+	"author":	"...",
+	"description":	{
+		"":	""
+	},
+	"version":	"",
+	"runOnStartup":	false,
+	"supportedOS":	"windows|mac",
+	"editEnabled":	true,
+	"iconFilename":	"AddInIcon.svg"
+}
+
+ 
+
+It took me days to figure this out. I hope this helps someone. Autodesk, a more descriptive error message would be much appreciated.
+
+ 
+Report
+Message 5 of 8
+crazybrain13
+Contributor crazybrain13
+in reply to scm
+‎12-02-2025 04:29 AM
+
+Thank you so much, I had given up on this thinking there would need to be an update or something to make this work correctly. Added an id, restarted fusion, and it worked like it was supposed to. Thank You!
+Report
+Message 6 of 8
+dejanlukic
+Explorer dejanlukic
+in reply to scm
+‎01-23-2026 10:44 PM
+
+Thank you man! That's crazy, I would've never figured it out. Super curious what made you think to try that, if you remember?
+Report
+Message 7 of 8
+scm
+Explorer scm
+‎01-23-2026 11:22 PM
+
+Glad it was helpful to you.
+
+ 
+
+After a frustrating day or two, I decided to approach the problem slowly but systematically.
+
+ 
+
+I simplified my add-on to the bare minimum needed to get to the failing function call and it still wouldn't work.
+
+ 
+
+Then I took a working add-in from the app store that uses this feature as a reference. I started deleting code in it bit by bit, reducing it too to a bare minimum example.
+
+ 
+
+I figured as the two add-ins get increasingly similar, the reference add-in would eventually produce this error too, and then I'd know that the last bit of code that I removed/changed from the reference add-in is what my add-in is missing.
+
+ 
+
+In the end, I had both add-ins to the point where their python code was 100% identical. And yet one add-in produced this error and the other didn't. I copied the files back and forth several times. I just couldn't believe it.
+
+ 
+
+The only explanation left was that the difference had to be in a non-python file. That's when I started comparing the manifest. 
+
+ 
+
+I can see why fusion needs the id. When storing/loading a design from/to cloud or disk, it needs to somehow associate the feature in the design's timeline with the add-in. It needs an identifier that won't change and will be identical on all installations.
+Report
+Message 8 of 8
+dejanlukic
+Explorer dejanlukic
+in reply to scm
+‎01-24-2026 03:56 AM
+I thought about how I’d approach it after I sent my question to you, and my first thought was to use an existing Add-In for cross referencing as you did - I don’t think I would’ve had the patience for the slow systematic approach, though! Really great work, and thanks for your sacrifice haha
+
+Thank you for sharing, I really appreciate it!
