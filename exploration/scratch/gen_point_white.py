@@ -71,3 +71,26 @@ for idx, (cr, cg, cb) in enumerate(COLORS):
     print(f'  point_{idx:02d}.png  rgb({cr},{cg},{cb})')
 
 print(f'\n{len(COLORS)} files written to {resources}')
+
+# --- Outlier sprite: hollow white ring ---
+# Pixels between inner and outer radius are opaque white; center is transparent.
+# Shape distinguishes outliers from solid row-color dots regardless of row color.
+RING_INNER = 3.5
+RING_OUTER = RADIUS  # 6.5
+
+def _ring_alpha(px: float, py: float) -> int:
+    dist = math.sqrt((px - CENTER) ** 2 + (py - CENTER) ** 2)
+    # Outer edge: fade out (same as circle)
+    outer_t = dist - (RING_OUTER - 0.5)
+    outer_a = 1.0 if outer_t <= 0.0 else (0.0 if outer_t >= 1.0 else 1.0 - outer_t)
+    # Inner edge: fade in (transparent inside, opaque outside)
+    inner_t = (RING_INNER + 0.5) - dist
+    inner_a = 1.0 if inner_t <= 0.0 else (0.0 if inner_t >= 1.0 else 1.0 - inner_t)
+    return int(round(255 * outer_a * inner_a))
+
+ring_mask   = [_ring_alpha(col, row) for row in range(SIZE) for col in range(SIZE)]
+ring_pixels = [(255, 255, 255, a) for a in ring_mask]
+outlier_path = os.path.join(resources, 'point_outlier.png')
+with open(outlier_path, 'wb') as f:
+    f.write(_make_png(ring_pixels))
+print(f'  point_outlier.png  hollow white ring')

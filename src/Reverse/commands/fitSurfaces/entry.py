@@ -19,8 +19,6 @@
 #   set isValidResult=True → preview IS the committed result, execute is a no-op
 #
 # Known open issues (deferred):
-#   - Per-row vertex colour: SolidColorEffect does not tint user-defined point sprites —
-#     all rows show in the image's native colour. See exploration/notes/custom-graphics.md.
 #   - Cursor circle showing selection radius: needs screen-space graphics on mouseMove,
 #     not yet validated. See exploration/notes/custom-graphics.md.
 #   - Duplicate vertex indices: STL meshes store one vertex per triangle corner, so shared
@@ -30,6 +28,7 @@ import adsk.core
 import adsk.fusion
 import math as _math
 import os
+import time as _time
 from ...lib import fusionAddInUtils as futil
 from ... import config
 
@@ -50,10 +49,16 @@ _RES         = os.path.dirname(os.path.abspath(__file__))
 POINT_IMAGES = [
     os.path.join(_RES, 'resources', f'point_{i:02d}.png') for i in range(12)
 ]
+OUTLIER_IMAGE = os.path.join(_RES, 'resources', 'point_outlier.png')
 
 local_handlers = []
 
-SURFACE_TYPES = ['Plane', 'Cylinder']  # Sphere, Cone: added when fitting is implemented
+SURFACE_TYPES = ['Auto', 'Plane', 'Cylinder']
+
+_MAX_RADIUS_RATIO  = 5.0    # cylinder r / point-cloud scale; above this → degenerate (plane-like)
+_OUTLIER_K         = 2.0    # outlier threshold multiplier: flag if error > mean + k*std
+_OUTLIER_MIN_ABS   = 1e-4   # minimum absolute error to flag as outlier (0.001 mm in cm units)
+                             # prevents floating-point noise from triggering outliers on perfect fits
 
 # ---------------------------------------------------------------------------
 # Module-level state (reset on commandCreated)
@@ -66,11 +71,13 @@ _mesh_count: int = 0    # vertex count
 _px_radius: int  = 20   # selection radius in screen pixels
 _expansion: float = 0.1 # surface overextension distance in cm (internal units); default 1 mm
 _cg_group        = None # adsk.fusion.CustomGraphicsGroup for vertex highlights
+_row_fit_results: list = []  # list[tuple[float, set[int]] | None] — per-row (rmse_cm, outlier_mesh_indices)
 
 # Minimum vertex count before fitting is attempted per surface type
-_MIN_PTS = {'Plane': 3, 'Cylinder': 4}
+_MIN_PTS = {'Plane': 3, 'Cylinder': 4, 'Auto': 4}
 
 _SHIFT_KEY = 0x2000000  # keyboard modifier bit for Shift
+_KEY_N     = 78         # adsk.core.KeyCodes.NKeyCode
 
 
 def _new_id(prefix: str) -> str:
@@ -285,6 +292,159 @@ def convex_hull_3d_on_plane(pts, n, d):
 
 
 # ---------------------------------------------------------------------------
+# Per-point error, RMSE, outlier detection
+# ---------------------------------------------------------------------------
+
+def _plane_point_errors(pts, n, d):
+    """Per-point unsigned distance from the plane dot(n,p)=d."""
+    return [abs(_dot(n, p) - d) for p in pts]
+
+
+def _cylinder_point_errors(pts, origin, axis, radius):
+    """Per-point unsigned radial distance error from cylinder surface."""
+    w = _normalize(axis)
+    u, v = _make_frame(w)
+    cx2 = _dot(origin, u)
+    cy2 = _dot(origin, v)
+    errors = []
+    for p in pts:
+        px2 = _dot(p, u)
+        py2 = _dot(p, v)
+        dist = _math.sqrt((px2 - cx2) ** 2 + (py2 - cy2) ** 2)
+        errors.append(abs(dist - radius))
+    return errors
+
+
+def _compute_rmse(errors):
+    n = len(errors)
+    return _math.sqrt(sum(e * e for e in errors) / n) if n else 0.0
+
+
+def _outlier_indices(errors, k=_OUTLIER_K):
+    """Indices where error > mean + k*std AND error > _OUTLIER_MIN_ABS.
+    The absolute floor prevents floating-point noise from triggering outliers
+    when all points fit nearly perfectly (RMSE ≈ 0).
+    """
+    n = len(errors)
+    if n < 2:
+        return set()
+    mean_e = sum(errors) / n
+    var_e  = sum((e - mean_e) ** 2 for e in errors) / n
+    std_e  = _math.sqrt(var_e)
+    threshold = max(mean_e + k * std_e, _OUTLIER_MIN_ABS)
+    return {i for i, e in enumerate(errors) if e > threshold}
+
+
+def _point_cloud_scale(pts):
+    """RMS distance from centroid — scale measure for plausibility check."""
+    n = len(pts)
+    cx = sum(p[0] for p in pts) / n
+    cy = sum(p[1] for p in pts) / n
+    cz = sum(p[2] for p in pts) / n
+    return _math.sqrt(sum((p[0]-cx)**2 + (p[1]-cy)**2 + (p[2]-cz)**2 for p in pts) / n)
+
+
+def _fit_plane(pts):
+    """Fit plane to pts. Returns (params_dict, rmse_cm, per_point_errors)."""
+    t0 = _time.perf_counter()
+    n, d, _ = fit_plane_to_points(pts)
+    t1 = _time.perf_counter()
+    errors = _plane_point_errors(pts, n, d)
+    rmse   = _compute_rmse(errors)
+    futil.log(f'{CMD_NAME}: fit_plane  {len(pts)}pts  fit={1000*(t1-t0):.1f}ms  RMSE={rmse*10:.3f}mm')
+    return {'type': 'Plane', 'n': n, 'd': d}, rmse, errors
+
+
+def _fit_cylinder(pts):
+    """Fit cylinder to pts. Returns (params_dict, rmse_cm, per_point_errors) or (None, None, None)."""
+    t0 = _time.perf_counter()
+    origin, axis, radius, _ = fit_cylinder_to_points(pts)
+    t1 = _time.perf_counter()
+    if origin is None:
+        futil.log(f'{CMD_NAME}: fit_cylinder  {len(pts)}pts  fit={1000*(t1-t0):.1f}ms  DEGENERATE')
+        return None, None, None
+    errors = _cylinder_point_errors(pts, origin, axis, radius)
+    rmse   = _compute_rmse(errors)
+    futil.log(f'{CMD_NAME}: fit_cylinder  {len(pts)}pts  fit={1000*(t1-t0):.1f}ms  RMSE={rmse*10:.3f}mm')
+    return {'type': 'Cylinder', 'origin': origin, 'axis': axis, 'radius': radius}, rmse, errors
+
+
+def _auto_fit(pts):
+    """Fit all surface types once, return the best (params_dict, rmse_cm, per_point_errors).
+    No double-fitting: the returned params are used directly for BRep creation.
+    """
+    plane_params, plane_rmse, plane_errors = _fit_plane(pts)
+    best_params, best_rmse, best_errors = plane_params, plane_rmse, plane_errors
+
+    if len(pts) >= _MIN_PTS['Cylinder']:
+        cyl_params, cyl_rmse, cyl_errors = _fit_cylinder(pts)
+        if cyl_params is not None and cyl_rmse is not None:
+            scale = _point_cloud_scale(pts)
+            if cyl_params['radius'] <= _MAX_RADIUS_RATIO * scale and cyl_rmse < best_rmse:
+                best_params, best_rmse, best_errors = cyl_params, cyl_rmse, cyl_errors
+
+    futil.log(f'{CMD_NAME}: auto → {best_params["type"]}')
+    return best_params, best_rmse, best_errors
+
+
+def _make_plane_brep(tbm, pts, params, expansion):
+    """Build plane BRep from pre-computed fit params. Returns body or None."""
+    n, d = params['n'], params['d']
+    hull = convex_hull_3d_on_plane(pts, n, d)
+    if len(hull) < 3:
+        futil.log(f'{CMD_NAME}: plane hull degenerate ({len(hull)} pts)')
+        return None
+    nv = len(hull)
+    lines = [
+        adsk.core.Line3D.create(
+            adsk.core.Point3D.create(hull[i][0],        hull[i][1],        hull[i][2]),
+            adsk.core.Point3D.create(hull[(i+1)%nv][0], hull[(i+1)%nv][1], hull[(i+1)%nv][2])
+        )
+        for i in range(nv)
+    ]
+    t0 = _time.perf_counter()
+    wire_body, _ = tbm.createWireFromCurves(lines)
+    if wire_body is None:
+        futil.log(f'{CMD_NAME}: plane wire creation failed')
+        return None
+    if expansion > 0:
+        temp_face = tbm.createFaceFromPlanarWires([wire_body])
+        if temp_face is not None:
+            _, face_normal = temp_face.faces[0].evaluator.getNormalAtParameter(
+                adsk.core.Point2D.create(0, 0)
+            )
+            offset_wire = wire_body.wires[0].offsetPlanarWire(face_normal, expansion, 2)
+            wire_body = offset_wire if offset_wire is not None else wire_body
+    surface = tbm.createFaceFromPlanarWires([wire_body])
+    futil.log(f'{CMD_NAME}: plane  brep={1000*(_time.perf_counter()-t0):.1f}ms')
+    if surface is None:
+        futil.log(f'{CMD_NAME}: plane face creation failed')
+    return surface
+
+
+def _make_cylinder_brep(tbm, pts, params, expansion):
+    """Build cylinder BRep from pre-computed fit params. Returns body or None."""
+    origin, axis, radius = params['origin'], params['axis'], params['radius']
+    t_min, t_max = cylinder_axial_bounds(pts, origin, axis)
+    p1 = [origin[i] + (t_min - expansion) * axis[i] for i in range(3)]
+    p2 = [origin[i] + (t_max + expansion) * axis[i] for i in range(3)]
+    ax_vec = adsk.core.Vector3D.create(axis[0], axis[1], axis[2])
+    c1 = adsk.core.Circle3D.createByCenter(adsk.core.Point3D.create(*p1), ax_vec, radius)
+    c2 = adsk.core.Circle3D.createByCenter(adsk.core.Point3D.create(*p2), ax_vec, radius)
+    t0 = _time.perf_counter()
+    wire1, _ = tbm.createWireFromCurves([c1])
+    wire2, _ = tbm.createWireFromCurves([c2])
+    if wire1 is None or wire2 is None:
+        futil.log(f'{CMD_NAME}: cylinder wire creation failed')
+        return None
+    surface = tbm.createRuledSurface(wire1.wires.item(0), wire2.wires.item(0))
+    futil.log(f'{CMD_NAME}: cylinder  brep={1000*(_time.perf_counter()-t0):.1f}ms')
+    if surface is None:
+        futil.log(f'{CMD_NAME}: cylinder ruled surface creation failed')
+    return surface
+
+
+# ---------------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------------
 
@@ -325,12 +485,13 @@ def stop():
 # ---------------------------------------------------------------------------
 
 def command_created(args: adsk.core.CommandCreatedEventArgs):
-    global _row_verts, _next_id, _mesh_pts, _mesh_count, _cg_group
-    _row_verts  = []
-    _next_id    = 0
-    _mesh_pts   = None
-    _mesh_count = 0
-    _cg_group   = None
+    global _row_verts, _next_id, _mesh_pts, _mesh_count, _cg_group, _row_fit_results
+    _row_verts       = []
+    _next_id         = 0
+    _mesh_pts        = None
+    _mesh_count      = 0
+    _cg_group        = None
+    _row_fit_results = []
     # _px_radius and _expansion are intentionally NOT reset — they persist between
     # command invocations within the same Fusion session.
 
@@ -343,7 +504,7 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     sel.setSelectionLimits(0, 1)
 
     # ---- Surface table ----
-    table = inputs.addTableCommandInput('surfaceTable', 'Surfaces', 3, '1:5:2')
+    table = inputs.addTableCommandInput('surfaceTable', 'Surfaces', 3, '3:5:2')
     table.minimumVisibleRows = 3
     table.maximumVisibleRows = 7
     table.columnSpacing      = 2
@@ -361,13 +522,6 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
 
     _add_row(inputs, table)
 
-    # ---- Status text (updating this triggers inputChanged → executePreview) ----
-    inputs.addTextBoxCommandInput(
-        'tbStatus', 'Status',
-        '(select a mesh body, then click the viewport to add vertices)',
-        2, True
-    )
-
     # ---- Selection radius slider ----
     sldr = inputs.addIntegerSliderCommandInput('sldrRadius', 'Radius (px)', 5, 200)
     sldr.valueOne = _px_radius
@@ -377,6 +531,18 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     exp_sldr.spinStep = 0.1   # 0.1 mm (spinStep is in unitType units)
     exp_sldr.valueOne = _expansion
 
+    # ---- Status text — full-width, at the bottom ----
+    # Updating this triggers inputChanged → executePreview.
+    # isFullWidth requires an empty label to span the full dialog width.
+    tb = inputs.addTextBoxCommandInput(
+        'tbStatus', '',
+        '(select a mesh body, then click the viewport to add vertices)',
+        2, True
+    )
+    tb.isFullWidth = True
+
+    futil.add_handler(cmd.activate,       command_activate,        local_handlers=local_handlers)
+    futil.add_handler(cmd.keyDown,        command_key_down,        local_handlers=local_handlers)
     futil.add_handler(cmd.inputChanged,   command_input_changed,   local_handlers=local_handlers)
     futil.add_handler(cmd.mouseClick,     command_mouse_click,     local_handlers=local_handlers)
     futil.add_handler(cmd.execute,        command_execute,         local_handlers=local_handlers)
@@ -400,7 +566,7 @@ def _add_row(inputs: adsk.core.CommandInputs, table: adsk.core.TableCommandInput
         adsk.core.DropDownStyles.TextListDropDownStyle
     )
     for t in SURFACE_TYPES:
-        dd.listItems.add(t, t == 'Plane', '')
+        dd.listItems.add(t, t == 'Auto', '')
 
     count = inputs.addStringValueInput(_new_id('surfVerts'), '', '0 pts')
     count.isReadOnly = True
@@ -410,15 +576,32 @@ def _add_row(inputs: adsk.core.CommandInputs, table: adsk.core.TableCommandInput
     table.addCommandInput(count, row, 2)
 
     _row_verts.append(set())
-    _renumber_labels(table)
+    _row_fit_results.append(None)
+    _update_row_labels(table)
     table.selectedRow = row
 
 
-def _renumber_labels(table: adsk.core.TableCommandInput):
+def _update_row_labels(table: adsk.core.TableCommandInput):
+    """Refresh col 0 (RMSE when fit exists, row number otherwise) and col 2 (count + outlier count)."""
     for r in range(table.rowCount):
         lbl = adsk.core.StringValueCommandInput.cast(table.getInputAtPosition(r, 0))
+        cnt = adsk.core.StringValueCommandInput.cast(table.getInputAtPosition(r, 2))
+
+        fit = _row_fit_results[r] if r < len(_row_fit_results) else None
+        n_verts = len(_row_verts[r]) if r < len(_row_verts) else 0
+
         if lbl:
-            lbl.value = str(r + 1)
+            if fit is not None:
+                rmse_mm = fit['rmse'] * 10.0  # cm → mm
+                lbl.value = f'{rmse_mm:.3f} mm'
+            else:
+                lbl.value = str(r + 1)
+
+        if cnt:
+            if fit is not None and fit['outliers']:
+                cnt.value = f'{n_verts} pts · {len(fit["outliers"])}⚠'
+            else:
+                cnt.value = f'{n_verts} pts'
 
 
 def _update_status(inputs: adsk.core.CommandInputs, table: adsk.core.TableCommandInput):
@@ -485,6 +668,64 @@ def _apply_world_matrix(pts_flat, count: int, mat: adsk.core.Matrix3D) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Activate handler — auto-select the mesh body if exactly one is visible
+# ---------------------------------------------------------------------------
+# Note: command.activate fires not just on dialog open but also when Fusion
+# re-activates the command after browser interactions (e.g. showing/hiding
+# bodies). As a result, unhiding a mesh while the dialog is open can trigger
+# an auto-selection. This is intentional — the logic is "if exactly one
+# visible mesh and nothing selected, select it", which is valid regardless of
+# what triggered the check. The selectionCount guard prevents overriding an
+# existing selection. The one known edge case is: user manually clears the
+# selection, then toggles browser visibility → re-auto-selects. Accepted as
+# low-probability and low-harm.
+
+def command_activate(args: adsk.core.CommandEventArgs):
+    cmd    = adsk.core.Command.cast(args.firingEvent.sender)
+    inputs = cmd.commandInputs
+    sel    = adsk.core.SelectionCommandInput.cast(inputs.itemById('selMesh'))
+    if sel is None or sel.selectionCount > 0:
+        return
+
+    design = adsk.fusion.Design.cast(app.activeProduct)
+    if design is None:
+        return
+
+    root    = design.rootComponent
+    visible = []
+
+    for mb in root.meshBodies:
+        if mb.isVisible:
+            visible.append(mb)
+
+    for occ in root.allOccurrences:
+        for mb in occ.component.meshBodies:
+            proxy = mb.createForAssemblyContext(occ)
+            if proxy is not None and proxy.isVisible:
+                visible.append(proxy)
+
+    if len(visible) == 1:
+        sel.addSelection(visible[0])
+        futil.log(f'{CMD_NAME}: auto-selected sole visible mesh body')
+
+
+# ---------------------------------------------------------------------------
+# Key down handler — hotkeys while the command dialog is open
+# ---------------------------------------------------------------------------
+
+def command_key_down(args: adsk.core.KeyboardEventArgs):
+    if args.keyCode != _KEY_N or args.modifierMask != 0:
+        return
+    cmd    = adsk.core.Command.cast(args.firingEvent.sender)
+    inputs = cmd.commandInputs
+    table  = adsk.core.TableCommandInput.cast(inputs.itemById('surfaceTable'))
+    if table is None or table.rowCount >= 12:
+        return
+    _add_row(inputs, table)
+    _update_status(inputs, table)
+
+
+# ---------------------------------------------------------------------------
 # Input changed handler
 # ---------------------------------------------------------------------------
 
@@ -507,7 +748,8 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
             return
         table.deleteRow(row)
         _row_verts.pop(row)
-        _renumber_labels(table)
+        _row_fit_results.pop(row)
+        _update_row_labels(table)
         table.selectedRow = max(0, row - 1)
         _update_status(inputs, table)
 
@@ -532,6 +774,11 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
             _mesh_count = 0
             for s in _row_verts:
                 s.clear()
+            for i in range(len(_row_fit_results)):
+                _row_fit_results[i] = None
+            # executePreview returns early when _mesh_pts is None, so _update_row_labels
+            # would never be reached — call it directly to clear col 0 RMSE labels.
+            _update_row_labels(table)
             for r in range(table.rowCount):
                 c = adsk.core.StringValueCommandInput.cast(table.getInputAtPosition(r, 2))
                 if c:
@@ -599,10 +846,19 @@ def command_mouse_click(args: adsk.core.MouseEventArgs):
     else:
         _row_verts[row] |= hit
 
-    # Update count label in table col 2
+    # Invalidate fit result — col 0 reverts to row number until next executePreview
+    if row < len(_row_fit_results):
+        _row_fit_results[row] = None
+
+    # Update count label in table col 2 (outlier count cleared since fit is now stale)
     count_inp = adsk.core.StringValueCommandInput.cast(table.getInputAtPosition(row, 2))
     if count_inp:
         count_inp.value = f'{len(_row_verts[row])} pts'
+
+    # Revert col 0 to row number now that fit is stale
+    lbl = adsk.core.StringValueCommandInput.cast(table.getInputAtPosition(row, 0))
+    if lbl:
+        lbl.value = str(row + 1)
 
     # Update status — this triggers inputChanged → executePreview
     _update_status(inputs, table)
@@ -617,96 +873,14 @@ def command_execute(args: adsk.core.CommandEventArgs):
     futil.log(f'{CMD_NAME}: execute (preview already committed)')
 
 
-def _create_surface_body(tbm, type_name, pts, expansion):
-    if type_name == 'Plane':
-        return _create_plane_body(tbm, pts, expansion)
-    elif type_name == 'Cylinder':
-        return _create_cylinder_body(tbm, pts, expansion)
-    else:
-        futil.log(f'{CMD_NAME}: "{type_name}" not yet implemented')
-        return None
-
-
-def _create_plane_body(tbm, pts, expansion):
-    n, d, resid = fit_plane_to_points(pts)
-    futil.log(f'{CMD_NAME}: plane n=[{n[0]:.4f},{n[1]:.4f},{n[2]:.4f}] d={d:.4f} resid={resid:.3e}')
-
-    hull = convex_hull_3d_on_plane(pts, n, d)
-    if len(hull) < 3:
-        futil.log(f'{CMD_NAME}: plane hull degenerate ({len(hull)} pts)')
-        return None
-
-    nv = len(hull)
-    lines = [
-        adsk.core.Line3D.create(
-            adsk.core.Point3D.create(hull[i][0],        hull[i][1],        hull[i][2]),
-            adsk.core.Point3D.create(hull[(i+1)%nv][0], hull[(i+1)%nv][1], hull[(i+1)%nv][2])
-        )
-        for i in range(nv)
-    ]
-
-    wire_body, _ = tbm.createWireFromCurves(lines)
-    if wire_body is None:
-        futil.log(f'{CMD_NAME}: plane wire creation failed')
-        return None
-
-    if expansion > 0:
-        # Get the actual face normal so the offset direction is always outward.
-        temp_face = tbm.createFaceFromPlanarWires([wire_body])
-        if temp_face is not None:
-            _, face_normal = temp_face.faces[0].evaluator.getNormalAtParameter(
-                adsk.core.Point2D.create(0, 0)
-            )
-            offset_wire = wire_body.wires[0].offsetPlanarWire(face_normal, expansion, 2)
-            wire_body = offset_wire if offset_wire is not None else wire_body
-
-    surface = tbm.createFaceFromPlanarWires([wire_body])
-    if surface is None:
-        futil.log(f'{CMD_NAME}: plane face creation failed')
-    return surface
-
-
-def _create_cylinder_body(tbm, pts, expansion):
-    origin, axis, radius, resid = fit_cylinder_to_points(pts)
-    if origin is None:
-        futil.log(f'{CMD_NAME}: cylinder fit degenerate — skipping')
-        return None
-    t_min, t_max = cylinder_axial_bounds(pts, origin, axis)
-    futil.log(
-        f'{CMD_NAME}: cylinder r={radius:.4f} '
-        f'axis=[{axis[0]:.4f},{axis[1]:.4f},{axis[2]:.4f}] '
-        f'extent=[{t_min:.4f},{t_max:.4f}] resid={resid:.3e}'
-    )
-
-    p1 = [origin[i] + (t_min - expansion) * axis[i] for i in range(3)]
-    p2 = [origin[i] + (t_max + expansion) * axis[i] for i in range(3)]
-    ax_vec = adsk.core.Vector3D.create(axis[0], axis[1], axis[2])
-
-    c1 = adsk.core.Circle3D.createByCenter(
-        adsk.core.Point3D.create(p1[0], p1[1], p1[2]), ax_vec, radius
-    )
-    c2 = adsk.core.Circle3D.createByCenter(
-        adsk.core.Point3D.create(p2[0], p2[1], p2[2]), ax_vec, radius
-    )
-
-    wire1, _ = tbm.createWireFromCurves([c1])
-    wire2, _ = tbm.createWireFromCurves([c2])
-    if wire1 is None or wire2 is None:
-        futil.log(f'{CMD_NAME}: cylinder wire creation failed')
-        return None
-
-    surface = tbm.createRuledSurface(wire1.wires.item(0), wire2.wires.item(0))
-    if surface is None:
-        futil.log(f'{CMD_NAME}: cylinder ruled surface creation failed')
-    return surface
-
-
 # ---------------------------------------------------------------------------
 # Execute preview — rebuild graphics + fit surfaces + commit via isValidResult
 # ---------------------------------------------------------------------------
 
 def command_execute_preview(args: adsk.core.CommandEventArgs):
+    t_start = _time.perf_counter()
     _rebuild_graphics()
+    t_graphics = _time.perf_counter()
 
     if _mesh_pts is None:
         return
@@ -730,19 +904,75 @@ def command_execute_preview(args: adsk.core.CommandEventArgs):
     for row in range(table.rowCount):
         verts = _row_verts[row] if row < len(_row_verts) else set()
         dd = adsk.core.DropDownCommandInput.cast(table.getInputAtPosition(row, 1))
-        type_name = dd.selectedItem.name if dd and dd.selectedItem else 'Plane'
+        type_name = dd.selectedItem.name if dd and dd.selectedItem else 'Auto'
 
         min_pts = _MIN_PTS.get(type_name, 3)
         if len(verts) < min_pts:
             continue
 
-        pts  = [[_mesh_pts[i*3], _mesh_pts[i*3+1], _mesh_pts[i*3+2]] for i in verts]
-        body = _create_surface_body(tbm, type_name, pts, _expansion)
+        t_row0 = _time.perf_counter()
+
+        # --- Cache check: skip fitting if vertex set AND surface type are unchanged ---
+        verts_frozen = frozenset(verts)
+        cache = _row_fit_results[row] if row < len(_row_fit_results) else None
+        if (cache is not None
+                and cache['verts_snapshot'] == verts_frozen
+                and cache.get('type_name') == type_name):
+            params      = cache['params']
+            rmse        = cache['rmse']
+            outlier_mesh = cache['outliers']
+            futil.log(f'{CMD_NAME}: row {row}  cache_hit  ({len(verts)} pts unchanged)')
+        else:
+            # Full fit — rebuild pts list and run fitter
+            verts_list = list(verts)
+            pts = [[_mesh_pts[i*3], _mesh_pts[i*3+1], _mesh_pts[i*3+2]] for i in verts_list]
+
+            if type_name == 'Auto':
+                params, rmse, errors = _auto_fit(pts)
+            elif type_name == 'Plane':
+                params, rmse, errors = _fit_plane(pts)
+            elif type_name == 'Cylinder':
+                params, rmse, errors = _fit_cylinder(pts)
+                if params is None:
+                    continue
+            else:
+                futil.log(f'{CMD_NAME}: "{type_name}" not yet implemented')
+                continue
+
+            outlier_local = _outlier_indices(errors)
+            outlier_mesh  = {verts_list[j] for j in outlier_local}
+            futil.log(f'{CMD_NAME}: row {row}  outliers={len(outlier_mesh)}')
+
+            if row < len(_row_fit_results):
+                _row_fit_results[row] = {
+                    'verts_snapshot': verts_frozen,
+                    'type_name':      type_name,
+                    'params':         params,
+                    'rmse':           rmse,
+                    'outliers':       outlier_mesh,
+                }
+
+        # --- BRep creation from params (always needed — preview bodies don't persist) ---
+        # pts may not be built yet on a cache hit; build it now (O(N), ~0ms)
+        pts = [[_mesh_pts[i*3], _mesh_pts[i*3+1], _mesh_pts[i*3+2]] for i in verts]
+
+        if params['type'] == 'Plane':
+            body = _make_plane_brep(tbm, pts, params, _expansion)
+        else:
+            body = _make_cylinder_brep(tbm, pts, params, _expansion)
+
+        t_row1 = _time.perf_counter()
+        futil.log(f'{CMD_NAME}: row {row}  total_row={1000*(t_row1-t_row0):.1f}ms')
 
         if body is not None:
             temp_bodies.append(body)
 
+    t_fit = _time.perf_counter()
+    _update_row_labels(table)
+
     if not temp_bodies:
+        futil.log(f'{CMD_NAME}: preview  graphics={1000*(t_graphics-t_start):.1f}ms  '
+                  f'fitting={1000*(t_fit-t_graphics):.1f}ms  (no bodies)')
         return
 
     # Add surfaces; wrap in BaseFeature for parametric mode
@@ -761,14 +991,18 @@ def command_execute_preview(args: adsk.core.CommandEventArgs):
     if base_feature:
         base_feature.finishEdit()
 
-    # Mark this preview result as the committed result — execute becomes a no-op
+    t_add = _time.perf_counter()
     args.isValidResult = True
-    futil.log(f'{CMD_NAME}: preview committed — {len(temp_bodies)} surface(s)')
+    futil.log(f'{CMD_NAME}: preview  graphics={1000*(t_graphics-t_start):.1f}ms  '
+              f'fitting={1000*(t_fit-t_graphics):.1f}ms  '
+              f'add_bodies={1000*(t_add-t_fit):.1f}ms  '
+              f'total={1000*(t_add-t_start):.1f}ms  ({len(temp_bodies)} surfaces)')
 
 
 def _rebuild_graphics():
     global _cg_group
 
+    t0 = _time.perf_counter()
     if _cg_group is not None and _cg_group.isValid:
         _cg_group.deleteMe()
     _cg_group = None
@@ -783,29 +1017,41 @@ def _rebuild_graphics():
     root  = design.rootComponent
     group = root.customGraphicsGroups.add()
 
-    total = 0
+    pts = _mesh_pts  # captured after the None-guard above; never None here
+
+    def _add_point_set(group, vis, image):
+        if not vis:
+            return
+        flat = []
+        for vi in vis:
+            flat.append(pts[vi * 3])
+            flat.append(pts[vi * 3 + 1])
+            flat.append(pts[vi * 3 + 2])
+        coords = adsk.fusion.CustomGraphicsCoordinates.create(flat)
+        ps = group.addPointSet(
+            coords, [],
+            adsk.fusion.CustomGraphicsPointTypes.UserDefinedCustomGraphicsPointType,
+            image
+        )
+        ps.depthPriority = 1
+        ps.isSelectable  = False
+
     for row_idx, verts in enumerate(_row_verts):
         if not verts:
             continue
 
-        flat = []
-        pts  = _mesh_pts
-        for vi in verts:
-            flat.append(pts[vi * 3])
-            flat.append(pts[vi * 3 + 1])
-            flat.append(pts[vi * 3 + 2])
+        fit = _row_fit_results[row_idx] if row_idx < len(_row_fit_results) else None
+        outlier_mesh = fit['outliers'] if (fit and fit['outliers']) else set()
 
-        coords = adsk.fusion.CustomGraphicsCoordinates.create(flat)
-        ps     = group.addPointSet(
-            coords, [],
-            adsk.fusion.CustomGraphicsPointTypes.UserDefinedCustomGraphicsPointType,
-            POINT_IMAGES[row_idx % len(POINT_IMAGES)]
-        )
-        ps.depthPriority = 1
-        ps.isSelectable  = False
-        total += len(verts)
+        normal_verts  = verts - outlier_mesh
+        outlier_verts = verts & outlier_mesh  # only outliers that are still selected
+
+        _add_point_set(group, normal_verts,  POINT_IMAGES[row_idx % len(POINT_IMAGES)])
+        _add_point_set(group, outlier_verts, OUTLIER_IMAGE)
 
     _cg_group = group
+    t1 = _time.perf_counter()
+    futil.log(f'{CMD_NAME}: _rebuild_graphics  total={1000*(t1-t0):.1f}ms')
 
 
 # ---------------------------------------------------------------------------

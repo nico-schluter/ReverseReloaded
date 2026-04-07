@@ -1,55 +1,19 @@
 # Custom Graphics — Open Problems
 
-Two custom graphics features are needed for the Fit Surfaces command but are not yet
-understood well enough to implement correctly in production code.
-
 ---
 
-## 1. Per-row vertex colour differentiation
+## 1. Per-row vertex colour differentiation — RESOLVED
 
-### What we want
-Each surface row's selected vertices displayed in a distinct colour so the user can
-visually distinguish which vertices belong to which surface.
+### Solution
+Use `UserDefinedCustomGraphicsPointType` with a separate pre-coloured PNG per row.
+`src/Reverse/commands/fitSurfaces/resources/` contains `point_00.png`–`point_11.png`
+(12 distinct colours) plus `point_outlier.png`. Each row's normal vertices are drawn
+with `POINT_IMAGES[row_idx % 12]`; outliers use `point_outlier.png`.
 
-### What was tried
-`CustomGraphicsPointSet` with `UserDefinedCustomGraphicsPointType` + `point.png` from
-the original Reverse add-in, with `CustomGraphicsSolidColorEffect` applied per row.
-
-### What happened / confirmed
-`point.png` is a red circle. All rows displayed as red regardless of the
-`SolidColorEffect` colour assigned. The PNG pixel colour wins; `SolidColorEffect` does
-not tint or override image pixels for `UserDefinedCustomGraphicsPointType`.
-
-### Root cause (confirmed)
-`SolidColorEffect` controls the entity's *material* colour, not its texture pixels.
-A user-defined point image is rendered as a texture billboard; its own RGBA values are
-used directly. The effect has no influence over those pixels.
-
-### Confirmed dead ends
-- `UserDefinedCustomGraphicsPointType` + red `point.png` + `SolidColorEffect` → all red (image wins)
-- `UserDefinedCustomGraphicsPointType` + white `point_white.png` + `SolidColorEffect` → all white (image still wins)
-
-**`SolidColorEffect` does not tint image-based point sprites regardless of the PNG colour.**
-
-### Remaining candidates (not yet tested)
-Two approaches still to try, in order of simplicity:
-
-**A. `PointCloudCustomGraphicsPointType` + `SolidColorEffect`**
-No image involved — points are single pixels rendered as geometry. `SolidColorEffect`
-may work correctly here since there is no texture to override it. The earlier observation
-that pixel points were "invisible" may have been a separate issue (they are genuinely
-tiny — 1px — and may need `depthPriority` to show above mesh faces).
-
-**B. `CustomGraphicsCoordinates.colors` + `CustomGraphicsVertexColorEffect`**
-Set per-coordinate RGBA via `coords.colors = [r,g,b,a, r,g,b,a, ...]` and apply
-`CustomGraphicsVertexColorEffect` to the point set. The API doc describes this for
-mesh vertex colouring but it may also apply to `CustomGraphicsPointSet`.
-
-### Suggested experiment
-In `exploration/scratch/FusionTesting/`, add a command that places two groups of 5
-points at known 3D positions and tries approach A then B, logging what is visible.
-The key questions are: (A) do pixel points appear at all, and do they colour correctly?
-(B) does vertex colour effect apply to point sets?
+### Why `SolidColorEffect` doesn't work (for reference)
+`SolidColorEffect` controls *material* colour, not texture pixels. A user-defined point
+image is rendered as a texture billboard; its own RGBA values are used directly. The
+effect has no influence over those pixels — confirmed dead end.
 
 ---
 

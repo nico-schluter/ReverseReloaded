@@ -19,7 +19,7 @@ Load the add-in via **Scripts & Add-Ins (Shift+S) → Add-Ins → point to `src/
 
 - [ ] Dialog opens when the button is clicked
 - [ ] Mesh body selection input is present and active
-- [ ] Table starts with one row (labelled "1"), type dropdown defaulting to "Plane"
+- [ ] Table starts with one row (labelled "1"), type dropdown defaulting to "Auto"
 - [ ] **+** toolbar button adds a row; label renumbers correctly
 - [ ] **−** toolbar button removes the selected row; labels renumber; cannot delete the last row
 - [ ] Radius (px) slider present, moves, range 5–200
@@ -34,6 +34,8 @@ Load the add-in via **Scripts & Add-Ins (Shift+S) → Add-Ins → point to `src/
 - [ ] Clicking a mesh body in the viewport selects it; status shows vertex count
 - [ ] Mesh in a sub-component (not root) loads correctly — world transform applied (vertex highlights appear in the right place)
 - [ ] Deselecting the mesh clears all vertex selections and resets all row counts to "0 pts"
+- [ ] With exactly one visible mesh body in the document, opening the dialog auto-selects it immediately (no manual click required); status shows vertex count
+- [ ] With zero or two or more visible mesh bodies, no auto-selection occurs — selection input is left empty
 
 ---
 
@@ -98,7 +100,32 @@ Add two or more rows and select vertices for each.
 
 ---
 
-## 10. Session persistence
+## 10. Cache correctness
+
+The fit-result cache skips re-fitting when the vertex set and surface type are both unchanged. These tests verify that stale cache values are never used.
+
+**Surface type change with the same vertices:**
+
+- [ ] Select ≥ 4 vertices on a cylindrical region with type set to "Auto" — a preview surface appears and the RMSE is shown in col 0
+- [ ] Change the type dropdown to "Plane" — the surface immediately updates to a plane fit, and the RMSE updates to reflect the plane residual (not the Auto result)
+- [ ] Change back to "Cylinder" — surface updates to a cylinder; RMSE updates again
+- [ ] Change from "Plane" to "Auto" — surface updates to whichever type Auto selects (check log for "auto →" message)
+
+**Mesh deselection clears stale state:**
+
+- [ ] Select a mesh, add vertices to one or more rows, allow surfaces to be fit (RMSE visible in col 0)
+- [ ] Deselect the mesh body — all row labels in col 0 immediately revert from RMSE values back to row numbers ("1", "2", …); vertex counts reset to "0 pts"
+- [ ] Reselect the same mesh body, add vertices again — fit runs fresh (log shows fit timing, not "cache_hit")
+
+**Cache hit does not re-fit unnecessarily:**
+
+- [ ] Select vertices and allow a fit to complete (RMSE shown in col 0)
+- [ ] Move a slider (e.g. Expansion) or switch to a different table row and back — the Text Command log should show "cache_hit" for that row on the next executePreview, not fresh fit timing
+- [ ] Add or remove vertices from the row — log should show a fresh fit (no "cache_hit") and RMSE should update
+
+---
+
+## 11. Session persistence
 
 - [ ] Closing and re-opening the dialog (without reloading the add-in) resets vertex selections
 - [ ] Radius and Expansion sliders restore their last-used values across invocations within the same session

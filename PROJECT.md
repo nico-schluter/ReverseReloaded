@@ -32,8 +32,6 @@ A Fusion 360 add-in for fitting primitive surfaces to mesh bodies. The primary u
 
 - Cursor circle (selection radius visualisation) — see `exploration/notes/custom-graphics.md`
 - `CustomFeature` wrapper for timeline editability — see `exploration/notes/ui-design.md`
-- Auto surface-type selection ("Auto" option in dropdown)
-- Fit error display per row
 - Auto-trim/join surfaces where they intersect (`booleanOperation` on open sheets)
 - Watertight detection → auto-convert to solid
 - Semi-automatic surface type detection from face groups / mesh normals
@@ -149,3 +147,30 @@ src/
 - `start()` panel fallback: if `ParaMeshCreatePanel` not found, falls back to `SolidScriptsAddinsPanel` instead of silently dropping the command
 - `_SHIFT_KEY = 0x2000000` constant replaces inline magic number
 - Verbose dev logging stripped throughout (per-click, per-slider, per-row, graphics rebuild, destroy); fit results and error paths retained
+
+---
+
+### 2026-04-07 — Auto mode, fit result caching, and two stale-cache bug fixes
+
+**Auto surface type:** Added "Auto" as a dropdown option. Fits all implemented types once per `executePreview` call and picks the lowest-RMSE result that passes the cylinder plausibility check (`radius ≤ _MAX_RADIUS_RATIO * point_cloud_scale`). No double-fitting — the winning params are used directly for BRep creation.
+
+**Fit result cache:** `_row_fit_results` stores `verts_snapshot` (a `frozenset` of selected vertex indices), the fit `params`, RMSE, and outlier set. On each `executePreview`, if the snapshot matches the current vertex set the fit step is skipped and BRep creation proceeds directly from cached params. Eliminates redundant fitting when only the expansion slider, active row selection, or status text changes.
+
+**Bug 1 — Type change not invalidating cache:**
+The cache hit check only compared `verts_snapshot`. Changing the surface type dropdown (e.g. "Auto" → "Plane") with the same vertex set produced a false cache hit, reusing the old type's fit params until a new vertex was selected. Fixed by adding `type_name` to both the cache hit predicate and the stored entry.
+
+**Bug 2 — Mesh deselection leaving stale RMSE labels:**
+When the mesh body was deselected, `_row_verts` was cleared but `_row_fit_results` was not. RMSE values in col 0 of the table stayed visible until new vertices were selected from the next mesh. Fixed by nulling out `_row_fit_results[i]` in the deselection branch of `command_input_changed`, causing `_update_row_labels` to revert col 0 to row numbers immediately.
+
+**Also fixed:** Manual test plan had the default type dropdown listed as "Plane" — it has always defaulted to "Auto". Corrected.
+
+**Per-row vertex colour:** Implemented from the start using 12 pre-coloured PNG images
+(`point_00.png`–`point_11.png`) — one image per row, cycling modulo 12. Outliers use a
+separate `point_outlier.png`. `SolidColorEffect` does not tint image-based sprites (confirmed
+dead end); the pre-coloured PNG approach sidesteps this entirely. See
+`exploration/notes/custom-graphics.md`.
+
+**Bug 2 correction:** The original fix nulled `_row_fit_results` in the deselect branch but
+never actually cleared col 0 — `executePreview` returns early on `_mesh_pts is None` before
+reaching `_update_row_labels`. Fixed by calling `_update_row_labels(table)` directly in the
+deselect branch.
