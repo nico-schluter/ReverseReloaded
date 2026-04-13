@@ -26,6 +26,7 @@
 
 import adsk.core
 import adsk.fusion
+import math
 import os
 import time as _time
 from ...lib import fusionAddInUtils as futil
@@ -53,9 +54,14 @@ OUTLIER_IMAGE = os.path.join(_RES, 'resources', 'point_outlier.png')
 
 local_handlers = []
 
-SURFACE_TYPES = ['Auto', 'Plane', 'Cylinder']
+SURFACE_TYPES = ['Auto', 'Plane', 'Cylinder', 'Cone', 'Sphere']
 
-_MAX_RADIUS_RATIO  = 5.0    # cylinder r / point-cloud scale; above this → degenerate (plane-like)
+_MAX_RADIUS_RATIO  = 5.0    # cylinder/sphere r / point-cloud scale; above this → degenerate
+_AUTO_MIN_IMPROVEMENT = 0.001  # cm (= 0.01 mm); a surface type must beat the current best by
+                                # at least this much to take priority. Prevents floating-point
+                                # noise in the Nelder-Mead optimiser (which reaches ~1e-5 cm on
+                                # perfect data) from letting sphere or cone displace plane/cylinder
+                                # on degenerate inputs like two collinear rings.
 
 # ---------------------------------------------------------------------------
 # Module-level state (reset on commandCreated)
@@ -71,7 +77,7 @@ _cg_group        = None # adsk.fusion.CustomGraphicsGroup for vertex highlights
 _row_fit_results: list = []  # list[tuple[float, set[int]] | None] — per-row (rmse_cm, outlier_mesh_indices)
 
 # Minimum vertex count before fitting is attempted per surface type
-_MIN_PTS = {'Plane': 3, 'Cylinder': 4, 'Auto': 4}
+_MIN_PTS = {'Plane': 3, 'Cylinder': 4, 'Cone': 5, 'Sphere': 4, 'Auto': 4}
 
 _SHIFT_KEY = 0x2000000  # keyboard modifier bit for Shift
 _KEY_N     = 78         # adsk.core.KeyCodes.NKeyCode
@@ -113,19 +119,75 @@ def _fit_cylinder(pts):
     return {'type': 'Cylinder', 'origin': origin, 'axis': axis, 'radius': radius}, rmse, errors
 
 
+def _fit_cone(pts):
+    """Fit cone to pts. Returns (params_dict, rmse_cm, per_point_errors) or (None, None, None)."""
+    t0 = _time.perf_counter()
+    apex, axis, half_angle, _ = fitting.fit_cone_to_points(pts)
+    t1 = _time.perf_counter()
+    if apex is None:
+        futil.log(f'{CMD_NAME}: fit_cone  {len(pts)}pts  fit={1000*(t1-t0):.1f}ms  DEGENERATE')
+        return None, None, None
+    errors = fitting.cone_point_errors(pts, apex, axis, half_angle)
+    rmse   = fitting.compute_rmse(errors)
+    futil.log(f'{CMD_NAME}: fit_cone  {len(pts)}pts  fit={1000*(t1-t0):.1f}ms  '
+              f'half_angle={math.degrees(half_angle):.1f}deg  RMSE={rmse*10:.3f}mm')
+    return {'type': 'Cone', 'apex': apex, 'axis': axis, 'half_angle': half_angle}, rmse, errors
+
+
+def _fit_sphere(pts):
+    """Fit sphere to pts. Returns (params_dict, rmse_cm, per_point_errors) or (None, None, None)."""
+    t0 = _time.perf_counter()
+    center, radius, _ = fitting.fit_sphere_to_points(pts)
+    t1 = _time.perf_counter()
+    if center is None:
+        futil.log(f'{CMD_NAME}: fit_sphere  {len(pts)}pts  fit={1000*(t1-t0):.1f}ms  DEGENERATE')
+        return None, None, None
+    errors = fitting.sphere_point_errors(pts, center, radius)
+    rmse   = fitting.compute_rmse(errors)
+    futil.log(f'{CMD_NAME}: fit_sphere  {len(pts)}pts  fit={1000*(t1-t0):.1f}ms  '
+              f'radius={radius*10:.2f}mm  RMSE={rmse*10:.3f}mm')
+    return {'type': 'Sphere', 'center': center, 'radius': radius}, rmse, errors
+
+
 def _auto_fit(pts):
     """Fit all surface types once, return the best (params_dict, rmse_cm, per_point_errors).
     No double-fitting: the returned params are used directly for BRep creation.
+
+    Evaluation order is plane → cylinder → cone → sphere, encoding a preference for
+    simpler/more-common types.  A later type only displaces the current best if it
+    improves RMSE by at least _AUTO_MIN_IMPROVEMENT (0.01 mm).  This prevents the
+    algebraically-exact sphere solver from winning over Nelder-Mead cylinder on
+    degenerate inputs where both fits are numerically near zero (e.g. two edge rings
+    of a cylinder that happen to be equidistant from a sphere centre).
     """
+    thresh = _AUTO_MIN_IMPROVEMENT
+    scale  = fitting.point_cloud_scale(pts)
+
     plane_params, plane_rmse, plane_errors = _fit_plane(pts)
     best_params, best_rmse, best_errors = plane_params, plane_rmse, plane_errors
 
     if len(pts) >= _MIN_PTS['Cylinder']:
         cyl_params, cyl_rmse, cyl_errors = _fit_cylinder(pts)
         if cyl_params is not None and cyl_rmse is not None:
-            scale = fitting.point_cloud_scale(pts)
-            if cyl_params['radius'] <= _MAX_RADIUS_RATIO * scale and cyl_rmse < best_rmse:
+            if cyl_params['radius'] <= _MAX_RADIUS_RATIO * scale and cyl_rmse < best_rmse - thresh:
                 best_params, best_rmse, best_errors = cyl_params, cyl_rmse, cyl_errors
+
+    if len(pts) >= _MIN_PTS['Cone']:
+        cone_params, cone_rmse, cone_errors = _fit_cone(pts)
+        if cone_params is not None and cone_rmse is not None:
+            # Plausibility: reject if the base radius at the data's far end exceeds
+            # _MAX_RADIUS_RATIO * point-cloud scale (same guard as cylinder/sphere).
+            apex, axis, ha = cone_params['apex'], cone_params['axis'], cone_params['half_angle']
+            t_min, t_max = fitting.cone_axial_bounds(pts, apex, axis)
+            max_r = math.tan(ha) * max(abs(t_min), abs(t_max))
+            if max_r <= _MAX_RADIUS_RATIO * scale and cone_rmse < best_rmse - thresh:
+                best_params, best_rmse, best_errors = cone_params, cone_rmse, cone_errors
+
+    if len(pts) >= _MIN_PTS['Sphere']:
+        sph_params, sph_rmse, sph_errors = _fit_sphere(pts)
+        if sph_params is not None and sph_rmse is not None:
+            if sph_params['radius'] <= _MAX_RADIUS_RATIO * scale and sph_rmse < best_rmse - thresh:
+                best_params, best_rmse, best_errors = sph_params, sph_rmse, sph_errors
 
     futil.log(f'{CMD_NAME}: auto → {best_params["type"]}')
     return best_params, best_rmse, best_errors
@@ -186,6 +248,100 @@ def _make_cylinder_brep(tbm, pts, params, expansion):
     if surface is None:
         futil.log(f'{CMD_NAME}: cylinder ruled surface creation failed')
     return surface
+
+
+def _make_cone_brep(tbm, pts, params, expansion):
+    """Build cone/frustum BRep from pre-computed fit params. Returns body or None.
+
+    Uses createCylinderOrCone(pointOne, r1, pointTwo, r2) — same API as cylinder
+    but r1 ≠ r2. The apex is found from the fit; axial bounds are relative to it.
+    """
+    apex       = params['apex']
+    axis       = params['axis']
+    half_angle = params['half_angle']
+    s          = math.tan(half_angle)
+
+    t_min, t_max = fitting.cone_axial_bounds(pts, apex, axis)
+
+    # Normalise axis so data is on the positive side.
+    # Use abs comparison: the fitter's abs(t_rel) residual is orientation-symmetric,
+    # so the optimizer may converge to either direction.  The condition t_max < 0
+    # handles the "all-negative" case, but misses "apex exactly at t_max=0" (pointed
+    # cone where the apex vertex is the outermost data point in that direction).
+    # abs(t_min) > abs(t_max) catches both: if most data is in the negative half, flip.
+    futil.log(f'{CMD_NAME}: cone axial_bounds  t_min={t_min*10:.3f}mm  t_max={t_max*10:.3f}mm')
+    if abs(t_min) > abs(t_max):
+        axis = [-axis[0], -axis[1], -axis[2]]
+        t_min, t_max = -t_max, -t_min   # both now positive, min < max
+        futil.log(f'{CMD_NAME}: cone axis flipped  t_min={t_min*10:.3f}mm  t_max={t_max*10:.3f}mm')
+
+    # Extend by expansion, clamped so we don't go past the apex (t1 can't go below 0).
+    t1 = max(0.0, t_min - expansion)
+    t2 = t_max + expansion
+
+    r1 = s * t1
+    r2 = s * t2
+
+    # When expansion pushes t1 to 0 the cone comes to a true apex point.
+    # createCylinderOrCone may or may not accept r=0; use a tiny epsilon to be safe.
+    _R_MIN = 1e-4  # 0.001 mm — imperceptible but avoids potential API rejection of r=0
+    r1 = max(_R_MIN, r1)
+
+    pt1 = adsk.core.Point3D.create(
+        apex[0] + t1 * axis[0],
+        apex[1] + t1 * axis[1],
+        apex[2] + t1 * axis[2],
+    )
+    pt2 = adsk.core.Point3D.create(
+        apex[0] + t2 * axis[0],
+        apex[1] + t2 * axis[1],
+        apex[2] + t2 * axis[2],
+    )
+
+    length = math.sqrt((pt2.x-pt1.x)**2 + (pt2.y-pt1.y)**2 + (pt2.z-pt1.z)**2)
+    futil.log(f'{CMD_NAME}: cone params  half_angle={math.degrees(half_angle):.2f}deg  '
+              f't1={t1*10:.3f}mm  t2={t2*10:.3f}mm  r1={r1*10:.3f}mm  r2={r2*10:.3f}mm  '
+              f'length={length*10:.3f}mm  '
+              f'pt1=({pt1.x*10:.2f},{pt1.y*10:.2f},{pt1.z*10:.2f})mm  '
+              f'pt2=({pt2.x*10:.2f},{pt2.y*10:.2f},{pt2.z*10:.2f})mm')
+
+    if length < 1e-6:
+        futil.log(f'{CMD_NAME}: cone degenerate — zero length body')
+        return None
+
+    t0 = _time.perf_counter()
+    try:
+        body = tbm.createCylinderOrCone(pt1, r1, pt2, r2)
+    except RuntimeError as e:
+        futil.log(f'{CMD_NAME}: cone createCylinderOrCone failed: {e}')
+        return None
+    futil.log(f'{CMD_NAME}: cone brep={1000*(_time.perf_counter()-t0):.1f}ms')
+    if body is None:
+        futil.log(f'{CMD_NAME}: cone body creation failed (returned None)')
+    return body
+
+
+def _make_sphere_brep(tbm, params):
+    """Build sphere BRep from pre-computed fit params. Returns body or None.
+
+    Expansion is not applied — a sphere is a closed surface with no boundary
+    edge to push outward; adding to the radius would resize it, not extend it.
+    """
+    center = params['center']
+    radius = params['radius']
+    pt = adsk.core.Point3D.create(center[0], center[1], center[2])
+    futil.log(f'{CMD_NAME}: sphere params  radius={radius*10:.3f}mm  '
+              f'center=({center[0]*10:.2f},{center[1]*10:.2f},{center[2]*10:.2f})mm  (no expansion)')
+    t0 = _time.perf_counter()
+    try:
+        body = tbm.createSphere(pt, radius)
+    except RuntimeError as e:
+        futil.log(f'{CMD_NAME}: sphere createSphere failed: {e}')
+        return None
+    futil.log(f'{CMD_NAME}: sphere brep={1000*(_time.perf_counter()-t0):.1f}ms')
+    if body is None:
+        futil.log(f'{CMD_NAME}: sphere body creation failed (returned None)')
+    return body
 
 
 # ---------------------------------------------------------------------------
@@ -335,14 +491,16 @@ def _update_row_labels(table: adsk.core.TableCommandInput):
         n_verts = len(_row_verts[r]) if r < len(_row_verts) else 0
 
         if lbl:
-            if fit is not None:
+            if fit is not None and fit.get('failed'):
+                lbl.value = 'failed'
+            elif fit is not None:
                 rmse_mm = fit['rmse'] * 10.0  # cm → mm
                 lbl.value = f'{rmse_mm:.3f} mm'
             else:
                 lbl.value = str(r + 1)
 
         if cnt:
-            if fit is not None and fit['outliers']:
+            if fit is not None and not fit.get('failed') and fit['outliers']:
                 cnt.value = f'{n_verts} pts · {len(fit["outliers"])}⚠'
             else:
                 cnt.value = f'{n_verts} pts'
@@ -662,6 +820,9 @@ def command_execute_preview(args: adsk.core.CommandEventArgs):
         if (cache is not None
                 and cache['verts_snapshot'] == verts_frozen
                 and cache.get('type_name') == type_name):
+            if cache.get('failed'):
+                futil.log(f'{CMD_NAME}: row {row}  cache_hit  (failed, {len(verts)} pts unchanged)')
+                continue
             params      = cache['params']
             rmse        = cache['rmse']
             outlier_mesh = cache['outliers']
@@ -678,6 +839,17 @@ def command_execute_preview(args: adsk.core.CommandEventArgs):
             elif type_name == 'Cylinder':
                 params, rmse, errors = _fit_cylinder(pts)
                 if params is None:
+                    _row_fit_results[row] = {'verts_snapshot': verts_frozen, 'type_name': type_name, 'failed': True}
+                    continue
+            elif type_name == 'Cone':
+                params, rmse, errors = _fit_cone(pts)
+                if params is None:
+                    _row_fit_results[row] = {'verts_snapshot': verts_frozen, 'type_name': type_name, 'failed': True}
+                    continue
+            elif type_name == 'Sphere':
+                params, rmse, errors = _fit_sphere(pts)
+                if params is None:
+                    _row_fit_results[row] = {'verts_snapshot': verts_frozen, 'type_name': type_name, 'failed': True}
                     continue
             else:
                 futil.log(f'{CMD_NAME}: "{type_name}" not yet implemented')
@@ -702,8 +874,15 @@ def command_execute_preview(args: adsk.core.CommandEventArgs):
 
         if params['type'] == 'Plane':
             body = _make_plane_brep(tbm, pts, params, _expansion)
-        else:
+        elif params['type'] == 'Cylinder':
             body = _make_cylinder_brep(tbm, pts, params, _expansion)
+        elif params['type'] == 'Cone':
+            body = _make_cone_brep(tbm, pts, params, _expansion)
+        elif params['type'] == 'Sphere':
+            body = _make_sphere_brep(tbm, params)
+        else:
+            futil.log(f'{CMD_NAME}: BRep creation not implemented for type "{params["type"]}"')
+            body = None
 
         t_row1 = _time.perf_counter()
         futil.log(f'{CMD_NAME}: row {row}  total_row={1000*(t_row1-t_row0):.1f}ms')

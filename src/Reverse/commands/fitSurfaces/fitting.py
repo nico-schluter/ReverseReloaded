@@ -2,15 +2,20 @@
 # Ported from exploration/scratch/pure_python_fitting.py and validated there.
 #
 # Public API used by entry.py:
-#   fit_plane_to_points(pts)            → (n, d, resid)
-#   fit_cylinder_to_points(pts)         → (origin, axis, radius, resid)
-#   cylinder_axial_bounds(pts, o, ax)   → (t_min, t_max)
-#   convex_hull_3d_on_plane(pts, n, d)  → list of 3D hull points
-#   plane_point_errors(pts, n, d)       → list[float]
-#   cylinder_point_errors(pts, o, ax, r)→ list[float]
-#   compute_rmse(errors)                → float
-#   outlier_indices(errors)             → set[int]
-#   point_cloud_scale(pts)              → float
+#   fit_plane_to_points(pts)                    → (n, d, resid)
+#   fit_cylinder_to_points(pts)                 → (origin, axis, radius, resid)
+#   cylinder_axial_bounds(pts, o, ax)           → (t_min, t_max)
+#   fit_cone_to_points(pts)                     → (apex, axis, half_angle, resid)
+#   cone_axial_bounds(pts, apex, ax)            → (t_min, t_max)  [relative to apex]
+#   fit_sphere_to_points(pts)                   → (center, radius, resid)
+#   convex_hull_3d_on_plane(pts, n, d)          → list of 3D hull points
+#   plane_point_errors(pts, n, d)               → list[float]
+#   cylinder_point_errors(pts, o, ax, r)        → list[float]
+#   cone_point_errors(pts, apex, ax, half_angle)→ list[float]
+#   sphere_point_errors(pts, center, radius)    → list[float]
+#   compute_rmse(errors)                        → float
+#   outlier_indices(errors)                     → set[int]
+#   point_cloud_scale(pts)                      → float
 
 import math as _math
 
@@ -42,7 +47,15 @@ def _sub(a, b):
 
 def _make_frame(w):
     """Return orthonormal (u, v) such that (u, v, w) is a right-handed frame."""
-    ref = [w[1], w[2], w[0]]
+    # Choose the standard-basis vector least parallel to w — avoids zero cross product
+    # when all components are equal (e.g. w = [1,1,1]/√3).
+    ax, ay, az = abs(w[0]), abs(w[1]), abs(w[2])
+    if ax <= ay and ax <= az:
+        ref = [1.0, 0.0, 0.0]
+    elif ay <= az:
+        ref = [0.0, 1.0, 0.0]
+    else:
+        ref = [0.0, 0.0, 1.0]
     u = _normalize(_cross(w, ref))
     v = _cross(w, u)
     return u, v
@@ -53,6 +66,22 @@ def _spherical_to_dir(theta, phi):
         _math.sin(theta) * _math.sin(phi),
         _math.cos(phi),
     ]
+
+
+def _center_points(pts):
+    """Subtract centroid from all points. Returns (centered_pts, centroid).
+
+    Used by every fitter to keep coordinates small and near origin, which
+    prevents large-magnitude columns (e.g. xi², t_i²) from dominating the
+    normal equations and causing ill-conditioning.  The caller is responsible
+    for shifting the fitted geometry back to world space afterwards.
+    """
+    n = len(pts)
+    gcx = sum(p[0] for p in pts) / n
+    gcy = sum(p[1] for p in pts) / n
+    gcz = sum(p[2] for p in pts) / n
+    gc  = [gcx, gcy, gcz]
+    return [[p[0]-gcx, p[1]-gcy, p[2]-gcz] for p in pts], gc
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +121,46 @@ def _lstsq3(H, b_vec):
     if x is None:
         return None, float('inf')
     resid = sum((sum(H[k][j]*x[j] for j in range(3)) - b_vec[k])**2 for k in range(len(H)))
+    return x, resid
+
+
+def _solve_nxn(A, b):
+    """Gaussian elimination with partial pivoting for an N×N system. Returns x or None."""
+    n = len(b)
+    M = [[A[i][j] for j in range(n)] + [b[i]] for i in range(n)]
+    for col in range(n):
+        max_row = max(range(col, n), key=lambda r: abs(M[r][col]))
+        M[col], M[max_row] = M[max_row], M[col]
+        pivot = M[col][col]
+        if abs(pivot) < 1e-15:
+            return None
+        for row in range(col+1, n):
+            f = M[row][col] / pivot
+            for j in range(col, n+1):
+                M[row][j] -= f * M[col][j]
+    x = [0.0]*n
+    for i in range(n-1, -1, -1):
+        x[i] = M[i][n]
+        for j in range(i+1, n):
+            x[i] -= M[i][j]*x[j]
+        x[i] /= M[i][i]
+    return x
+
+
+def _lstsq_n(H, b_vec):
+    """Normal equations for an over-determined system with any number of columns."""
+    nc = len(H[0])
+    HtH = [[0.0]*nc for _ in range(nc)]
+    Htb = [0.0]*nc
+    for row, bi in zip(H, b_vec):
+        for i in range(nc):
+            Htb[i] += row[i] * bi
+            for j in range(nc):
+                HtH[i][j] += row[i] * row[j]
+    x = _solve_nxn(HtH, Htb)
+    if x is None:
+        return None, float('inf')
+    resid = sum((sum(H[k][j]*x[j] for j in range(nc)) - b_vec[k])**2 for k in range(len(H)))
     return x, resid
 
 
@@ -151,10 +220,12 @@ def _fit_plane_on_axis(pts, n):
 
 def fit_plane_to_points(pts):
     """Returns (n, d, resid) — unit normal, offset, sum-of-squared residuals."""
-    best, _ = _grid_search(lambda t, p: _fit_plane_on_axis(pts, _spherical_to_dir(t, p))[1])
-    opt = _nelder_mead(lambda a: _fit_plane_on_axis(pts, _spherical_to_dir(a[0], a[1]))[1], best)
+    cpts, gc = _center_points(pts)
+    best, _ = _grid_search(lambda t, p: _fit_plane_on_axis(cpts, _spherical_to_dir(t, p))[1])
+    opt = _nelder_mead(lambda a: _fit_plane_on_axis(cpts, _spherical_to_dir(a[0], a[1]))[1], best)
     n = _normalize(_spherical_to_dir(opt[0], opt[1]))
-    d, resid = _fit_plane_on_axis(pts, n)
+    d_c, resid = _fit_plane_on_axis(cpts, n)
+    d = d_c + _dot(n, gc)
     return n, d, resid
 
 
@@ -189,16 +260,19 @@ def _fit_cylinder_on_axis(pts, axis):
 
 def fit_cylinder_to_points(pts):
     """Returns (origin, axis, radius, resid)."""
+    cpts, gc = _center_points(pts)
+
     def cost(t, p):
-        res = _fit_cylinder_on_axis(pts, _spherical_to_dir(t, p))
+        res = _fit_cylinder_on_axis(cpts, _spherical_to_dir(t, p))
         return float('inf') if res is None else res[2]
     best, _ = _grid_search(cost)
     opt = _nelder_mead(lambda a: cost(a[0], a[1]), best)
     axis = _normalize(_spherical_to_dir(opt[0], opt[1]))
-    result = _fit_cylinder_on_axis(pts, axis)
+    result = _fit_cylinder_on_axis(cpts, axis)
     if result is None:
         return None, None, None, float('inf')
-    origin, radius, resid = result
+    origin_c, radius, resid = result
+    origin = [origin_c[i] + gc[i] for i in range(3)]
     return origin, axis, radius, resid
 
 
@@ -206,6 +280,184 @@ def cylinder_axial_bounds(pts, origin, axis):
     """Returns (t_min, t_max) — extent of pts along axis from origin."""
     projs = [_dot(_sub(p, origin), axis) for p in pts]
     return min(projs), max(projs)
+
+
+# ---------------------------------------------------------------------------
+# Cone fitting
+# ---------------------------------------------------------------------------
+# Derivation in exploration/notes/cone-fitting-gauss-newton.md.
+#
+# Direct 4-parameter Gauss-Newton fit for a fixed axis direction.
+# Parameters: (cx, cy, s, b) where r_i = s*t_i + b is the cone surface condition
+# and (cx, cy) is the axis offset in the perpendicular plane.
+#
+# This avoids the rank-deficiency of the old algebraic 5-parameter linearization
+# which introduced a redundant parameter and failed on data with ≤ 2 distinct
+# t-values (e.g. two-ring frustums from CAD export).
+# ---------------------------------------------------------------------------
+
+def _fit_cone_on_axis(pts, axis, _max_iter=20, _tol=1e-12):
+    """Gauss-Newton 4-parameter cone fit for a fixed axis direction.
+    Returns (apex, half_angle_rad, residual) or (None, None, inf) on failure.
+    """
+    w = _normalize(axis)
+    u, v = _make_frame(w)
+    n = len(pts)
+
+    t_v = [_dot(p, w) for p in pts]
+    q_x = [_dot(p, u) for p in pts]
+    q_y = [_dot(p, v) for p in pts]
+
+    # Initialize cx, cy from centroid of projected coords
+    cx = sum(q_x) / n
+    cy = sum(q_y) / n
+
+    # Initialize s, b from linear regression of r_i vs t_i
+    r_v = [_math.sqrt((q_x[i] - cx)**2 + (q_y[i] - cy)**2) for i in range(n)]
+    sum_t  = sum(t_v)
+    sum_r  = sum(r_v)
+    sum_tt = sum(t * t for t in t_v)
+    sum_tr = sum(t_v[i] * r_v[i] for i in range(n))
+    det = n * sum_tt - sum_t * sum_t
+    if abs(det) < 1e-30:
+        # All points at same axial height — cone is underdetermined.
+        return None, None, float('inf')
+    s = (n * sum_tr - sum_t * sum_r) / det
+    b = (sum_r * sum_tt - sum_t * sum_tr) / det
+
+    # Gauss-Newton iterations
+    for _iteration in range(_max_iter):
+        r_v = [_math.sqrt((q_x[i] - cx)**2 + (q_y[i] - cy)**2) for i in range(n)]
+        e = [r_v[i] - (s * t_v[i] + b) for i in range(n)]
+
+        # Build J^T J (4x4) and J^T e (4x1)
+        JtJ = [[0.0] * 4 for _ in range(4)]
+        Jte = [0.0] * 4
+
+        for i in range(n):
+            ri = r_v[i]
+            if ri < 1e-15:
+                continue  # point on axis — Jacobian undefined, skip
+            dx = -(q_x[i] - cx) / ri
+            dy = -(q_y[i] - cy) / ri
+            row = [dx, dy, -t_v[i], -1.0]
+            for a in range(4):
+                Jte[a] += row[a] * e[i]
+                for bb in range(4):
+                    JtJ[a][bb] += row[a] * row[bb]
+
+        delta = _solve_nxn(JtJ, Jte)
+        if delta is None:
+            return None, None, float('inf')
+
+        cx -= delta[0]
+        cy -= delta[1]
+        s  -= delta[2]
+        b  -= delta[3]
+
+        if sum(d * d for d in delta) < _tol:
+            break
+
+    # Reject hourglass: s*t + b must not change sign across the data range.
+    t_min_data = min(t_v)
+    t_max_data = max(t_v)
+    val_lo = s * t_min_data + b
+    val_hi = s * t_max_data + b
+    if val_lo * val_hi < 0:
+        return None, None, float('inf')
+
+    if abs(s) < 1e-15:
+        # Degenerate: cylinder, not cone.
+        return None, None, float('inf')
+
+    t_apex = -b / s
+    apex = [cx * u[i] + cy * v[i] + t_apex * w[i] for i in range(3)]
+    half_angle = _math.atan(abs(s))
+
+    # Geometric radial residual.
+    resid = 0.0
+    for i in range(n):
+        r_i = _math.sqrt((q_x[i] - cx)**2 + (q_y[i] - cy)**2)
+        err = r_i - abs(s) * abs(t_v[i] - t_apex)
+        resid += err * err
+
+    return apex, half_angle, resid
+
+
+def fit_cone_to_points(pts):
+    """Returns (apex, axis, half_angle_rad, resid).
+    Grid search over axis direction + Nelder-Mead refinement.
+    Per-axis evaluation uses Gauss-Newton on 4 geometric parameters.
+
+    Data is centered at its centroid before fitting to keep coordinates small.
+    The apex is shifted back to world space after solving.
+    """
+    cpts, gc = _center_points(pts)
+
+    def cost(theta, phi):
+        result = _fit_cone_on_axis(cpts, _spherical_to_dir(theta, phi))
+        return float('inf') if result[0] is None else result[2]
+
+    best, best_cost = _grid_search(cost)
+    if best_cost == float('inf'):
+        return None, None, None, float('inf')
+    opt = _nelder_mead(lambda a: cost(a[0], a[1]), best)
+
+    axis   = _normalize(_spherical_to_dir(opt[0], opt[1]))
+    result = _fit_cone_on_axis(cpts, axis)
+    if result[0] is None:
+        # Nelder-Mead drifted to a degenerate direction — fall back to best grid direction.
+        axis   = _normalize(_spherical_to_dir(best[0], best[1]))
+        result = _fit_cone_on_axis(cpts, axis)
+    if result[0] is None:
+        return None, None, None, float('inf')
+
+    apex_c, half_angle, resid = result
+    apex = [apex_c[i] + gc[i] for i in range(3)]
+    return apex, axis, half_angle, resid
+
+
+def cone_axial_bounds(pts, apex, axis):
+    """Returns (t_min, t_max) — extent of pts along axis, measured from apex."""
+    projs = [_dot(_sub(p, apex), axis) for p in pts]
+    return min(projs), max(projs)
+
+
+# ---------------------------------------------------------------------------
+# Sphere fitting
+# ---------------------------------------------------------------------------
+# A point p lies on a sphere with center c and radius r iff ||p - c||² = r².
+# Expanding and rearranging:
+#   px² + py² + pz² = A·px + B·py + C·pz + E
+# where A=2cx, B=2cy, C=2cz, E=r²-cx²-cy²-cz².
+# This is a direct 4-parameter linear system — no axis to optimise over.
+# Solve via 4×4 normal equations (O(n)), recover:
+#   cx=A/2, cy=B/2, cz=C/2,  r=sqrt(cx²+cy²+cz²+E)
+# ---------------------------------------------------------------------------
+
+def fit_sphere_to_points(pts):
+    """Returns (center, radius, resid) or (None, None, inf) on failure."""
+    cpts, gc = _center_points(pts)
+
+    y_v = [p[0]**2 + p[1]**2 + p[2]**2 for p in cpts]
+    H   = [[p[0], p[1], p[2], 1.0] for p in cpts]
+    x, _ = _lstsq_n(H, y_v)
+    if x is None:
+        return None, None, float('inf')
+
+    cx_c = x[0] / 2.0
+    cy_c = x[1] / 2.0
+    cz_c = x[2] / 2.0
+    r_sq = cx_c**2 + cy_c**2 + cz_c**2 + x[3]
+    if r_sq <= 0:
+        return None, None, float('inf')
+
+    r      = _math.sqrt(r_sq)
+    center = [cx_c + gc[0], cy_c + gc[1], cz_c + gc[2]]
+
+    resid = sum((_math.sqrt((p[0]-center[0])**2 + (p[1]-center[1])**2 + (p[2]-center[2])**2) - r)**2
+                for p in pts)
+    return center, r, resid
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +515,29 @@ def cylinder_point_errors(pts, origin, axis, radius):
         dist = _math.sqrt((px2 - cx2) ** 2 + (py2 - cy2) ** 2)
         errors.append(abs(dist - radius))
     return errors
+
+
+def cone_point_errors(pts, apex, axis, half_angle):
+    """Per-point unsigned radial error from cone surface."""
+    w  = _normalize(axis)
+    u, v = _make_frame(w)
+    s  = _math.tan(half_angle)
+    t_apex_abs = _dot(apex, w)
+    cx = _dot(apex, u)
+    cy = _dot(apex, v)
+    errors = []
+    for p in pts:
+        r_i   = _math.sqrt((_dot(p, u) - cx)**2 + (_dot(p, v) - cy)**2)
+        t_rel = _dot(p, w) - t_apex_abs
+        # abs(t_rel): correct for any axis orientation relative to apex.
+        errors.append(abs(r_i - s * abs(t_rel)))
+    return errors
+
+
+def sphere_point_errors(pts, center, radius):
+    """Per-point unsigned distance error from sphere surface."""
+    return [abs(_math.sqrt((p[0]-center[0])**2 + (p[1]-center[1])**2 + (p[2]-center[2])**2) - radius)
+            for p in pts]
 
 
 def compute_rmse(errors):

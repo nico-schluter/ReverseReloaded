@@ -21,12 +21,25 @@ A Fusion 360 add-in for fitting primitive surfaces to mesh bodies. The primary u
 - Custom graphics vertex highlighting — per-row point sprites (12 colours)
 - Panel fallback — if `ParaMeshCreatePanel` not found, falls back to Scripts/Add-ins panel
 
+## v2.0 — Released
+
+- Cone fitting — Gauss-Newton 4-parameter solver; handles frustums, pointed cones, oblique cuts
+- Sphere fitting — algebraic 4-parameter linear solve (no optimisation needed)
+- Auto surface type detection — fits all types per row, picks lowest RMSE with absolute improvement threshold and engineering-prior evaluation order (plane → cylinder → cone → sphere)
+- Fit result caching — skips redundant fitting when only expansion slider or row selection changes; invalidated on vertex or type change
+- Outlier detection — per-point error flagging (mean + k·std with absolute floor); outlier vertices shown with distinct sprite
+- Centroid centering — applied to all fitters for numerical stability when mesh is far from world origin
+- Plausibility guards — cylinder, cone, and sphere fits rejected in Auto mode if implied radius exceeds 5× point-cloud scale
+- Failed-fit sentinel — row label shows "failed" on degenerate manual fits; cache prevents re-running
+- N hotkey — add new surface row without clicking the toolbar button
+- Auto-select sole visible mesh body on command open
+- Debug test mesh command (6 reference primitives, registered only when DEBUG=True)
+
 ## Next Release
 
 ### Planned
 
-- Sphere fitting
-- Cone fitting
+*(nothing currently planned)*
 
 ### Deferred
 
@@ -174,3 +187,111 @@ dead end); the pre-coloured PNG approach sidesteps this entirely. See
 never actually cleared col 0 — `executePreview` returns early on `_mesh_pts is None` before
 reaching `_update_row_labels`. Fixed by calling `_update_row_labels(table)` directly in the
 deselect branch.
+
+---
+
+### 2026-04-13 — Cone fitting + centroid centering for all fitters
+
+**Cone fitting implemented** (`fitting.py`, `entry.py`). Algorithm: algebraic 5-parameter
+linearization — for a fixed axis, the cone condition `r_i = s·|t_i - t_apex|` is squared and
+expanded into a linear system `H·x = y` (5 unknowns: A=2cx, B=2cy, C=s², D=2sb, E=b²-cx²-cy²).
+Solved via 5×5 normal equations — O(n) per axis candidate, same cost structure as the algebraic
+circle fit for cylinders. Outer optimization: 9×5 grid search + Nelder-Mead on spherical angles
+(θ, φ), same pattern as cylinder/plane. Derivation in `exploration/notes/cone-fitting.md`;
+validated in `exploration/scratch/cone_fitting.py`.
+
+BRep construction uses `createCylinderOrCone(pt1, r1, pt2, r2)` (same API as cylinder, r1 ≠ r2).
+The axis is oriented so data is on the positive side; a small epsilon floor prevents r=0 at the
+narrow end from potentially being rejected by the API.
+
+**Hourglass rejection:** If the fitted apex falls strictly inside the data's axial range (with
+1% span tolerance for floating-point), the solution is a double-nappe (hourglass) — rejected with
+cost=inf. Only single-nappe patches are returned.
+
+**Centroid centering applied to all fitters** (`fit_plane_to_points`, `fit_cylinder_to_points`,
+`fit_cone_to_points`, `fit_sphere_to_points`). A shared `_center_points(pts) → (cpts, centroid)`
+helper subtracts the centroid before fitting and the caller shifts geometry back to world space.
+This prevents large-magnitude columns (`xi²+yi²`, `t_i²`) from dominating the normal equations
+when the mesh is far from the world origin. The pattern is reused by all fitters.
+
+---
+
+### 2026-04-13 — Debug test mesh command
+
+**`Add Test Meshes` command** added (`src/Reverse/commands/addTestMeshes/entry.py`), registered only when `config.DEBUG = True`.
+
+Generates six BRep reference solids and six matching mesh bodies in the active design:
+- Sphere (r=20 mm)
+- Full cylinder (r=15 mm, h=40 mm)
+- Partial cylinder (~270°, one quadrant removed via boolean subtract)
+- Flat plane slab (80×80×4 mm, select top-face vertices for plane fitting)
+- Cone with apex (r=20 mm base, h=50 mm)
+- Frustum / truncated cone (r=20 mm → r=10 mm, h=40 mm)
+
+Bodies are spaced 100 mm apart along X. BRep solids (`Ref_*`) are the ground truth; mesh bodies (`Mesh_*`) are the inputs for Fit Surfaces. Both are created inside a single `BaseFeature` using `TemporaryBRepManager` shapes tessellated with `HighQualityTriangleMesh` and `meshBodies.addByTriangleMeshData`.
+
+---
+
+### 2026-04-13 — Sphere fitting
+
+**Sphere fitting implemented** (`fitting.py`, `entry.py`). Algorithm: algebraic 4-parameter
+linearization — the sphere condition `||p - c||² = r²` expands to a linear system
+`y_i = A·px + B·py + C·pz + E` where y_i=px²+py²+pz², unknowns A=2cx, B=2cy, C=2cz,
+E=r²-cx²-cy²-cz². Solved via 4×4 normal equations — **no axis to optimise over**, so
+no grid search or Nelder-Mead needed. This is the simplest of all the fitters: a single O(n)
+linear solve.
+
+BRep construction uses `createSphere(center, radius)`. Expansion is not applied — a sphere is
+a closed solid with no boundary edge to push outward. Auto mode applies the same
+`_MAX_RADIUS_RATIO` plausibility guard as cylinder.
+
+**Cone degenerate early-exit:** If the cone grid search finds no valid solution (all-inf costs),
+Nelder-Mead is skipped entirely. Previously all 500 iterations would run with NaN comparisons
+(inf - inf) and never converge, causing ~1–3s stalls on spherical geometry in Auto mode.
+
+**Cone fitter: Nelder-Mead fallback to grid best:** After Nelder-Mead optimisation, the final
+`_fit_cone_on_axis` call could return DEGENERATE if the optimiser drifted to an angle where C≤0
+or the hourglass check triggers — even though the grid search found a valid starting direction.
+The fitter now falls back to the grid's best direction when this happens, preventing spurious
+DEGENERATE returns on real cone geometry.
+
+---
+
+### 2026-04-13 — Cone fitting rewrite: Gauss-Newton 4-parameter
+
+**Root cause:** The algebraic 5-parameter linearization introduced a redundant parameter
+(E = b² − cx² − cy²), making the 5×5 normal equations rank-deficient when data has ≤ 2
+distinct t-values. This is the common case for CAD-exported frustums (two vertex rings at
+different heights). The solver either returned singular or produced silently wrong results
+(e.g. 36.87° half-angle instead of the correct 14.04°, with misleadingly low RMSE).
+
+**Fix:** Replaced with a direct Gauss-Newton fit on the 4 geometric parameters (cx, cy, s, b)
+where `r_i = s·t_i + b`. The residual `e_i = r_i − (s·t_i + b)` is minimized via
+`δθ = −(JᵀJ)⁻¹ Jᵀe` iterations (4×4 system). Initialization: cx/cy from centroid, s/b from
+linear regression of r vs t. Converges in 2–3 iterations.
+
+This approach has no rank-deficiency issues because there are no redundant parameters. Verified
+on the Ref_Frustum STL data: 2-ring subsets (where the old method failed completely) now produce
+exact results (14.04° half-angle, RMSE ≈ 0). Also handles oblique-cut frustums and multi-ring
+data correctly.
+
+Also removed the temporary `fusionAddInUtils` import that was added for cone-fit diagnostics.
+
+Derivation: `exploration/notes/cone-fitting-gauss-newton.md`.
+Experimental verification: `exploration/scratch/cone_gauss_newton.py`.
+
+**Manual fit failure: row label and cache sentinel:** When a manually-typed fit (Cylinder, Cone,
+Sphere) returns DEGENERATE, the row label now shows "failed" instead of retaining the previous
+fit's RMSE. Previously the cache was left untouched on failure, so the old result would display
+until a new vertex was added. A sentinel `{'failed': True}` is stored so subsequent cache hits also
+skip BRep creation without re-running the fitter.
+
+**Auto mode: absolute improvement threshold (`_AUTO_MIN_IMPROVEMENT = 0.001 cm`):** Each surface
+type in the evaluation chain (plane → cylinder → cone → sphere) must beat the current best by at
+least 0.01 mm to take priority. Without this, the algebraically-exact sphere solver (which reaches
+~1e-12 cm RMSE on perfect data) would displace the Nelder-Mead cylinder fitter (~1e-5 cm on perfect
+data) on degenerate inputs where both fits are numerically near-zero — for example, selecting the
+two end rings of a cylinder, which are equidistant from a sphere centre. The relative factor
+approach fails here because the ratio can be 10^6+, making any finite factor insufficient; an
+absolute threshold works because real fitting errors are always >> 0.01 mm. The evaluation order
+encodes the engineering prior: planes and cylinders are far more common than cones and spheres.
