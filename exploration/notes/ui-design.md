@@ -42,7 +42,24 @@ undocumented behaviour — needs experimentation before committing. Deferred.
 
 Watertight detection (all edges valence 2 → attempt solid stitch) also deferred.
 
-## CustomFeature notes (deferred)
+## CustomFeature notes (deferred — DO NOT REVISIT)
+
+> **Update 2026-04-28:** the "validated as correct in principle" claim below was
+> wrong. A follow-up investigation in PhosEDM-WCAM
+> (`exploration/scratch/customfeature_spike/`) confirmed the Custom Feature
+> API's edit lifecycle is broken in current Fusion: the right-click "Edit
+> Feature" menu item is missing entirely and double-click on the timeline node
+> does nothing — true even for Autodesk's own canonical CustomPocket sample.
+> The API has been "Preview" for 5+ years with no public adoption and no path
+> to general availability. Autodesk's currently-shipping add-ins (e.g.
+> SinterBox) avoid it. See
+> [phosedm-wcam findings](../../../../phosedm-wcam/repo/exploration/notes/customfeature_findings.md)
+> for the full investigation.
+>
+> If a future ReverseReloaded release wants timeline persistence, take a
+> different path — `Document.attributes` + `entityToken` for storage with
+> auto-remapping entity references, or `adsk.cam.Setups` if the workflow fits
+> the Manufacture workspace.
 
 The design below is validated as correct in principle — the friction was in
 integrating all the pieces, not in any individual API call being broken. When this
