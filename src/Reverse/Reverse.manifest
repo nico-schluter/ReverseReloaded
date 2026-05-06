@@ -1,13 +1,14 @@
 {
 	"autodeskProduct":	"Fusion",
 	"type":	"addin",
-	"author":	"PhosSstems",
+	"author":	"phos.systems",
 	"description":	{
-		"":	"Mesh to BRep conversion"
+		"":	"Mesh to BRep conversion. The add-in does not collect any user data. Privacy policy: privacy-policy.html (shipped with this add-in)."
 	},
 	"version":	"",
 	"runOnStartup":	false,
 	"supportedOS":	"windows|mac",
 	"editEnabled":	true,
-	"iconFilename":	"AddInIcon.svg"
+	"iconFilename":	"AddInIcon.svg",
+	"privacyPolicyFilename":	"privacy-policy.html"
 }
